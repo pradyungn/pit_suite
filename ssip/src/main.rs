@@ -34,6 +34,7 @@ struct TracerState {
     farloads: u64,
     alubranch: u64,
     alujalr: u64,
+    constbr: u64,
 
     alubranch_dist: u64,
     alubranch_dist_tot: u64,
@@ -84,6 +85,10 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
 
         println!("Branch Fusion (Theoretical): {} ({:.2}%)", state.alubranch,
                  100.0 * (state.alubranch as f64) / (state.ctrlinsts as f64));
+
+        println!("Branch Fusion w/ Const Idioms (Theoretical): {} ({:.2}%)", state.constbr,
+                 100.0 * (state.constbr as f64) / (state.ctrlinsts as f64));
+
         println!("JALR Fusion (Theoretical): {} ({:.2}%)", state.alujalr,
                  100.0 * (state.alujalr as f64) / (state.ctrlinsts as f64));
 
@@ -238,7 +243,7 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
         }
 
         // Theoretical
-        (ADDI{ rd, .. } | SLTI{ rd, .. }  | ANDI{ rd, .. } | SRAI{ rd, .. },
+        (ADDI{ rd, rs1: rs1e, .. } | SLTI{ rd, rs1: rs1e, .. }  | ANDI{ rd, rs1: rs1e, .. } | SRAI{ rd, rs1: rs1e, .. },
          // | ADD{ rd, .. } | SLT{ rd, .. } | AND{ rd, .. } | SUB{ rd, .. },
          BEQ { rs1, rs2, .. }  | BNE  { rs1, rs2, .. } |
          BLT  { rs1, rs2, .. } | BGE  { rs1, rs2, .. } | BLTU { rs1, rs2, .. } |
@@ -248,9 +253,11 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
 
             state.alubranch_dist_tot += state.alubranch_dist;
             state.alubranch_dist = 0;
+
+            if rs1e == 0 { state.constbr += 1; }
         }
 
-        (AUIPC{ rd, .. } | LUI{ rd, .. },
+        (AUIPC{ rd, .. } | LUI{ rd, .. } | ADDI{ rd, .. },
          JALR{ rd: rd2, rs1, .. })
             if rd == rs1 && rd == rd2 => {
             state.fusions += 1;

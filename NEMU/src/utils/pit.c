@@ -1,6 +1,7 @@
 #include <utils.h>
 #include <malloc.h>
 #include <pit.h>
+#include <profiling/profiling_control.h>
 
 #define PITBUFSZ 512
 FILE *pit_fp = NULL;
@@ -75,11 +76,12 @@ bool is_mem_access(uint32_t instr)
 
 void pit(pitPacket pkt, bool mem) {
   if (pit_fp) {
+    if (pitcount++ < warmup_interval) return;
+
     pitbufmem[pitptr] = mem;
     pitbuf[pitptr] = pkt;
 
     pitptr++;
-    pitcount++;
     pitmemcount += (int)mem;
 
     if (pitptr == PITBUFSZ) {
@@ -93,6 +95,6 @@ void end_pit() {
     drain_pit();
     fclose(pit_fp);
     printf("[PIT] Drained %d instructions, %d memory instructions\n",
-           pitcount, pitmemcount);
+           pitcount-(int)warmup_interval, pitmemcount);
   }
 }
