@@ -59,6 +59,7 @@ pub enum Instruction {
     OR { rd: u32, rs1: u32, rs2: u32 },
     AND { rd: u32, rs1: u32, rs2: u32 },
     FENCE { pred: Iorw, succ: Iorw },
+    CBO,
     ECALL,
     EBREAK,
     // S-mode:
@@ -344,6 +345,13 @@ impl Instruction {
                 | Instruction::BLTU { .. }
                 | Instruction::BGEU { .. }
         )
+    }
+
+    pub fn mem(&self) -> bool {
+        (matches!(
+            self,
+            Instruction::CBO
+        ) || self.load() || self.store())
     }
 
     /// Check whether an instruction could load from memory.

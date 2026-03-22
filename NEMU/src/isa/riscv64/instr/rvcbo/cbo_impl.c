@@ -101,11 +101,15 @@ void cbo_zero(Decode *s){
 void cbo_inval(Decode *s){
   int cause;
   PUSH_CONTEXT(&cause);
+
   if (cause) {
     pop_context();
     longjmp_exception(convert_load_to_store_exception(cause));
   } else {
     rtlreg_t* addr_p = dsrc1;
+
+    s -> is_mem = true;
+    s -> maddr = *dsrc1;
 
     not_translate_check(*addr_p, MEM_TYPE_READ);
 
@@ -124,6 +128,9 @@ void cbo_flush(Decode *s){
   } else {
     rtlreg_t *addr_p = dsrc1;
 
+    s -> is_mem = true;
+    s -> maddr = *dsrc1;
+
     not_translate_check(*addr_p, MEM_TYPE_READ);
 
     // do nothing
@@ -140,6 +147,9 @@ void cbo_clean(Decode *s){
     longjmp_exception(convert_load_to_store_exception(cause));
   } else {
     rtlreg_t *addr_p = dsrc1;
+
+    s -> is_mem = true;
+    s -> maddr = *dsrc1;
 
     not_translate_check(*addr_p, MEM_TYPE_READ);
 
@@ -175,6 +185,9 @@ void cbo_inval_mmu(Decode *s){
 
     rtlreg_t *addr_p = dsrc1;
 
+    s -> is_mem = true;
+    s -> maddr = *dsrc1;
+
     translate_and_check(*addr_p, MEM_TYPE_READ);
 
     // do nothing
@@ -191,6 +204,9 @@ void cbo_flush_mmu(Decode *s){
     longjmp_exception(convert_load_to_store_exception(cause));
   } else {
     rtlreg_t *addr_p = dsrc1;
+
+    s -> is_mem = true;
+    s -> maddr = *dsrc1;
 
     translate_and_check(*addr_p, MEM_TYPE_READ);
 
@@ -209,6 +225,9 @@ void cbo_clean_mmu(Decode *s){
   } else {
 
     rtlreg_t *addr_p = dsrc1;
+
+    s -> is_mem = true;
+    s -> maddr = *dsrc1;
 
     translate_and_check(*addr_p, MEM_TYPE_READ);
 

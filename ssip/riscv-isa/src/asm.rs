@@ -56,6 +56,7 @@ impl Display for Instruction {
             Instruction::EBREAK => f.write_str("ebreak"),
             Instruction::SRET => f.write_str("sret"),
             Instruction::SFENCE_VMA { rs1, rs2 } => write!(f, "sfence.vma x{rs1}, x{rs2}"),
+            Instruction::CBO => write!(f, "cbo"),
             Instruction::MRET => f.write_str("mret"),
             Instruction::WFI => f.write_str("wfi"),
             Instruction::LWU { rd, rs1, offset } => write!(f, "lwu x{rd}, {offset}(x{rs1})"),

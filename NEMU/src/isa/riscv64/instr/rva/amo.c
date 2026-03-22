@@ -98,6 +98,11 @@ def_rtl(amo_slow_path, rtlreg_t *dest, const rtlreg_t *src1, const rtlreg_t *src
     int success = ((cpu.lr_addr ^ paddr) >> CONFIG_RESERVATION_SET_WIDTH == 0) && cpu.lr_valid;
     Logti("cpu sc addr=%lx scr1=%lx vaild=%ld success=%d", cpu.lr_addr,*src1, cpu.lr_valid,success);
     cpu.lr_valid = 0;
+
+    // address will be dmmy for now.
+    s -> is_mem = true;
+    s -> maddr = 0;
+
     if (success) {
       rtl_sm(s, src2, src1, 0, width, MMU_DYNAMIC);
     } else {

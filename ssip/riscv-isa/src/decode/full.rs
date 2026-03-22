@@ -110,6 +110,7 @@ pub fn decode(code: u32, target: &Target) -> Instruction {
         (Op::OP, 0b110, 0b0000000) => OR { rd, rs1, rs2 },
         (Op::OP, 0b111, 0b0000000) => AND { rd, rs1, rs2 },
         (Op::MISC_MEM, 0b000, _) if (code >> 28) & 0b1111 == 0b000 => FENCE { succ, pred },
+        (Op::MISC_MEM, 0b010, _) => CBO, // general bucket, no validation enforced
         (Op::SYSTEM, 0b000, 0b0000000) if rd == 0b0 && rs1 == 0b0 && rs2 == 0b0 => ECALL,
         (Op::SYSTEM, 0b000, 0b0000000) if rd == 0b0 && rs1 == 0b0 && rs2 == 0b1 => EBREAK,
         // RV32 base instruction set:

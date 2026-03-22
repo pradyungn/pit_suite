@@ -19,6 +19,7 @@ struct TracerState {
     vector: u64,
 
     // mem_checker
+    meminsts: u64,
     loadinsts: u64,
     storeinsts: u64,
     ctrlinsts: u64,
@@ -47,6 +48,8 @@ fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
                  100.0 * (state.loadinsts as f64) / (state.insts as f64));
         println!("Store Accesses: {} ({:.2}%)", state.storeinsts,
                  100.0 * (state.storeinsts as f64) / (state.insts as f64));
+        println!("Mem Insts: {} ({:.2}%)", state.meminsts,
+                 100.0 * (state.meminsts as f64) / (state.insts as f64));
         println!("Control Instructions: {} ({:.2}%)", state.ctrlinsts,
                  100.0 * (state.ctrlinsts as f64) / (state.insts as f64));
     } else {
@@ -58,6 +61,10 @@ fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
 
         if p.inst.store() {
             state.storeinsts += 1;
+        }
+
+        if p.inst.mem() {
+            state.meminsts += 1;
         }
 
         if p.inst.branch() {
@@ -299,7 +306,8 @@ fn main() {
     let mut tracereader = BufReader::new(trace);
 
     // omitted from Xiangshan Spec due to package compat: KHV
-    let target = Target::from_str("RV64IMAFDCZicsr_Zifencei_Zba_Zbb_Zbs").unwrap();
+    let target = Target::from_str("RV64IMAFDCZicsr_Zifencei_Zba_Zbb_Zbs_Zbkb")
+        .unwrap().with_s_mode(true).with_privileged(true);
 
     let mut state = TracerState::default();
 
@@ -326,7 +334,7 @@ fn main() {
         };
 
         let pit_inst = match inst {
-            _ if inst.load() || inst.store() => {
+            _ if inst.mem() => {
                 let mut maddr = [0u8; 8];
 
                 match tracereader.read_exact(&mut maddr) {
@@ -341,6 +349,7 @@ fn main() {
                     },
                 }
             }
+
 
             UNIMP => {
                 let opcode = u32::from_le_bytes(ibuf) & 0x7F;
