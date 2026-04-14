@@ -129,6 +129,7 @@ pub enum Instruction {
     AMOMAX_D { rd: u32, rs1: u32, rs2: u32, rl: u32, aq: u32 },
     AMOMINU_D { rd: u32, rs1: u32, rs2: u32, rl: u32, aq: u32 },
     AMOMAXU_D { rd: u32, rs1: u32, rs2: u32, rl: u32, aq: u32 },
+
     // RV32F extension:
     FLW { frd: u32, rs1: u32, offset: i32 },
     FSW { rs1: u32, frs2: u32, offset: i32 },
@@ -267,6 +268,7 @@ pub enum Instruction {
     FCVT_LU_H { rd: u32, rm: u32, frs1: u32 },
     FCVT_H_L { frd: u32, rm: u32, rs1: u32 },
     FCVT_H_LU { frd: u32, rm: u32, rs1: u32 },
+
     // Zawrs extension:
     WRS_NTO,
     WRS_STO,
@@ -352,6 +354,78 @@ impl Instruction {
             self,
             Instruction::CBO
         ) || self.load() || self.store())
+    }
+
+    pub fn float(&self) -> bool {
+        matches!(self,
+                 Instruction::FLW { .. } | Instruction::FSW { .. } |
+                 Instruction::FMADD_S { .. } | Instruction::FMSUB_S { .. } |
+                 Instruction::FNMSUB_S { .. } | Instruction::FNMADD_S { .. } |
+                 Instruction::FADD_S { .. } | Instruction::FSUB_S { .. } |
+                 Instruction::FMUL_S { .. } | Instruction::FDIV_S { .. } |
+                 Instruction::FSQRT_S { .. } | Instruction::FSGNJ_S { .. } |
+                 Instruction::FSGNJN_S { .. } | Instruction::FSGNJX_S { .. } |
+                 Instruction::FMIN_S { .. } | Instruction::FMAX_S { .. } |
+                 Instruction::FCVT_W_S { .. } | Instruction::FCVT_WU_S { .. } |
+                 Instruction::FMV_X_W { .. } | Instruction::FEQ_S { .. } |
+                 Instruction::FLT_S { .. } | Instruction::FLE_S { .. } |
+                 Instruction::FCLASS_S { .. } | Instruction::FCVT_S_W { .. } |
+                 Instruction::FCVT_S_WU { .. } | Instruction::FMV_W_X { .. } |
+                 Instruction::FCVT_L_S { .. } |
+                 Instruction::FCVT_LU_S { .. } | Instruction::FCVT_S_L { .. } |
+                 Instruction::FCVT_S_LU { .. } |
+                 Instruction::FLD { .. } | Instruction::FSD { .. } |
+                 Instruction::FMADD_D { .. } | Instruction::FMSUB_D { .. } |
+                 Instruction::FNMSUB_D { .. } | Instruction::FNMADD_D { .. } |
+                 Instruction::FADD_D { .. } | Instruction::FSUB_D { .. } |
+                 Instruction::FMUL_D { .. } | Instruction::FDIV_D { .. } |
+                 Instruction::FSQRT_D { .. } | Instruction::FSGNJ_D { .. } |
+                 Instruction::FSGNJN_D { .. } | Instruction::FSGNJX_D { .. } |
+                 Instruction::FMIN_D { .. } | Instruction::FMAX_D { .. } |
+                 Instruction::FCVT_S_D { .. } | Instruction::FCVT_D_S { .. } |
+                 Instruction::FEQ_D { .. } | Instruction::FLT_D { .. } |
+                 Instruction::FLE_D { .. } | Instruction::FCLASS_D { .. } |
+                 Instruction::FCVT_W_D { .. } | Instruction::FCVT_WU_D { .. } |
+                 Instruction::FCVT_D_W { .. } | Instruction::FCVT_D_WU { .. } |
+                 Instruction::FCVT_L_D { .. } |
+                 Instruction::FCVT_LU_D { .. } | Instruction::FMV_X_D { .. } |
+                 Instruction::FCVT_D_L { .. } | Instruction::FCVT_D_LU { .. } |
+                 Instruction::FMV_D_X { .. } |
+                 Instruction::FLQ { .. } | Instruction::FSQ { .. } |
+                 Instruction::FMADD_Q { .. } | Instruction::FMSUB_Q { .. } |
+                 Instruction::FNMSUB_Q { .. } | Instruction::FNMADD_Q { .. } |
+                 Instruction::FADD_Q { .. } | Instruction::FSUB_Q { .. } |
+                 Instruction::FMUL_Q { .. } | Instruction::FDIV_Q { .. } |
+                 Instruction::FSQRT_Q { .. } | Instruction::FSGNJ_Q { .. } |
+                 Instruction::FSGNJN_Q { .. } | Instruction::FSGNJX_Q { .. } |
+                 Instruction::FMIN_Q { .. } | Instruction::FMAX_Q { .. } |
+                 Instruction::FCVT_S_Q { .. } | Instruction::FCVT_Q_S { .. } |
+                 Instruction::FCVT_D_Q { .. } | Instruction::FCVT_Q_D { .. } |
+                 Instruction::FEQ_Q { .. } | Instruction::FLT_Q { .. } |
+                 Instruction::FLE_Q { .. } | Instruction::FCLASS_Q { .. } |
+                 Instruction::FCVT_W_Q { .. } | Instruction::FCVT_WU_Q { .. } |
+                 Instruction::FCVT_Q_W { .. } | Instruction::FCVT_Q_WU { .. } |
+                 Instruction::FCVT_L_Q { .. } |
+                 Instruction::FCVT_LU_Q { .. } | Instruction::FCVT_Q_L { .. } |
+                 Instruction::FCVT_Q_LU { .. } |
+                 Instruction::FLH { .. } | Instruction::FSH { .. } | Instruction::FMADD_H { .. } |
+                 Instruction::FMSUB_H { .. } | Instruction::FNMSUB_H { .. } |
+                 Instruction::FNMADD_H { .. } | Instruction::FADD_H { .. } |
+                 Instruction::FSUB_H { .. } | Instruction::FMUL_H { .. } |
+                 Instruction::FDIV_H { .. } | Instruction::FSQRT_H { .. } |
+                 Instruction::FSGNJ_H { .. } | Instruction::FSGNJN_H { .. } |
+                 Instruction::FSGNJX_H { .. } | Instruction::FMIN_H { .. } |
+                 Instruction::FMAX_H { .. } | Instruction::FCVT_S_H { .. } |
+                 Instruction::FCVT_H_S { .. } | Instruction::FCVT_D_H { .. } |
+                 Instruction::FCVT_H_D { .. } | Instruction::FCVT_Q_H { .. } |
+                 Instruction::FCVT_H_Q { .. } | Instruction::FEQ_H { .. } |
+                 Instruction::FLT_H { .. } | Instruction::FLE_H { .. } |
+                 Instruction::FCLASS_H { .. } | Instruction::FCVT_W_H { .. } |
+                 Instruction::FCVT_WU_H { .. } | Instruction::FMV_X_H { .. } |
+                 Instruction::FCVT_H_W { .. } | Instruction::FCVT_H_WU { .. } |
+                 Instruction::FMV_H_X { .. } | Instruction::FCVT_L_H { .. } |
+                 Instruction::FCVT_LU_H { .. } | Instruction::FCVT_H_L { .. } |
+                 Instruction::FCVT_H_LU { .. })
     }
 
     /// Check whether an instruction could load from memory.

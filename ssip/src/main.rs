@@ -1,7 +1,22 @@
-use std::env;
 use std::fs::File;
 use std::str::FromStr;
+use clap::Parser;
 use riscv_isa::{self, Instruction::*, Target};
+
+#[derive(Parser)]
+#[command(about = "SuperSonic Instruction Profiler")]
+struct Args {
+    /// PIT trace file to analyze
+    tracefile: String,
+
+    /// Enable DFG generation with the given window size
+    #[arg(long, value_name = "WINDOW")]
+    window: Option<u64>,
+
+    /// ASM analysis parameter
+    #[arg(short = 'A', long, value_name = "N")]
+    asm: Option<u64>,
+}
 
 use std::io::{BufReader, Read, ErrorKind};
 
@@ -18,25 +33,25 @@ struct TracerState {
     compressed: u64,
     vector: u64,
 
-    // mem_checker
+    // inst mix
     meminsts: u64,
     loadinsts: u64,
     storeinsts: u64,
     ctrlinsts: u64,
+    floatinsts: u64,
 
-    // dfg_gen
+    // asm dumper
+    asm_range: u64,
 
     // fusionCheck
     lastinst: Option<PitInst>,
     fusions: u64,
+    logicfusion: u64,
     adjloads: u64,
-    shiftfusions: u64,
-    shiftadds: u64,
     farloads: u64,
     alubranch: u64,
     alujalr: u64,
     constbr: u64,
-
     alubranch_dist: u64,
     alubranch_dist_tot: u64,
 }
@@ -52,6 +67,8 @@ fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
                  100.0 * (state.meminsts as f64) / (state.insts as f64));
         println!("Control Instructions: {} ({:.2}%)", state.ctrlinsts,
                  100.0 * (state.ctrlinsts as f64) / (state.insts as f64));
+        println!("Float Instructions: {} ({:.2}%)", state.floatinsts,
+                 100.0 * (state.floatinsts as f64) / (state.insts as f64));
     } else {
         let p = pkt.unwrap();
 
@@ -70,10 +87,24 @@ fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
         if p.inst.branch() {
             state.ctrlinsts += 1;
         }
+
+        if p.inst.float() {
+            state.floatinsts += 1;
+        }
     }
 }
 
 fn dfg_gen(state: &mut TracerState, pkt: Option<&PitInst>, _: bool) {
+}
+
+fn asm_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
+    if !finish && state.insts <= state.asm_range {
+        print!("{}", pkt.unwrap().inst);
+        match pkt.unwrap().addr {
+            Some(x) => println!(" [0x{:08x}]", x),
+            None => println!("")
+        };
+    }
 }
 
 fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
@@ -87,8 +118,7 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
         println!("Far Loads: {} ({:.2}%)", state.farloads,
                  100.0 * (state.farloads as f64) / (state.loadinsts as f64));
 
-        println!("Shift Adds: {}", state.shiftadds);
-        println!("Shift Fusion: {}", state.shiftfusions);
+        println!("Logic Fusions: {}", state.logicfusion);
 
         println!("Branch Fusion (Theoretical): {} ({:.2}%)", state.alubranch,
                  100.0 * (state.alubranch as f64) / (state.ctrlinsts as f64));
@@ -121,14 +151,14 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
          SRLI{ rd: rd2, rs1, shamt: 29..=32 }) if rd == rd2 &&
             rs1 == rd => {
                 state.fusions += 1;
-                state.shiftfusions += 1;
+                state.logicfusion += 1;
             },
 
         (SLLI{ rd, shamt: 48, .. },
          SRLI{ rd: rd2, rs1, shamt: 48 }) if rd == rd2 &&
             rs1 == rd => {
                 state.fusions += 1;
-                state.shiftfusions += 1;
+                state.logicfusion += 1;
             },
 
         (SLLIW{ rd, shamt: 16, .. },
@@ -136,7 +166,7 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
          SRAIW{ rd: rd2, rs1, shamt: 16 }) if rd == rd2 &&
             rs1 == rd => {
                 state.fusions += 1;
-                state.shiftfusions += 1;
+                state.logicfusion += 1;
             }
 
         (SLLI{ rd, shamt: 1..=4, .. } |
@@ -144,14 +174,14 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
          ADD{ rd: rd2, rs1, rs2 }) if rd == rd2 &&
             (rs1 == rd || rs2 == rd) => {
                 state.fusions += 1;
-                state.shiftadds += 1;
+                state.logicfusion += 1;
             },
 
         (SRLI{ rd, shamt: 8, .. },
          ANDI{ rd: rd2, rs1, imm: 0xff }) if rd == rd2 &&
             rs1 == rd => {
                 state.fusions += 1;
-                state.shiftadds += 1;
+                state.logicfusion += 1;
             }
 
         // far load
@@ -171,12 +201,18 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
          ANDI{ rd: rd2, rs1, imm: 1 } |
          ZEXT_H{ rd: rd2, rs1 } |
          SEXT_H{ rd: rd2, rs1 }) if rd == rd2 &&
-            rs1 == rd => (),
+            rs1 == rd => {
+                state.fusions += 1;
+                state.logicfusion += 1;
+            },
 
         (LUI{ rd, .. },
          ADDI{ rd: rd2, rs1, .. } |
          ADDIW{ rd: rd2, rs1, .. }) if rd == rd2 &&
-            rs1 == rd => (),
+            rs1 == rd => {
+                state.fusions += 1;
+                state.logicfusion += 1;
+            },
 
         // TODO: Logic fusion (Done by Gemini)
         // oddadd & oddaddw: ANDI (imm == 1) + ADD/ADDW
@@ -192,6 +228,7 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
          OR { rd: rd2, rs1: rs1_2, rs2: rs2_2, .. })
             if rd1 == rd2 && (rd2 == rs1_2 || rd2 == rs2_2) => {
             state.fusions += 1;
+            state.logicfusion += 1;
         },
 
         // mulw7: ANDI (imm == 127) + MULW
@@ -199,6 +236,7 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
          MULW { rd: rd2, rs1: rs1_2, rs2: rs2_2, .. })
             if rd1 == rd2 && (rd2 == rs1_2 || rd2 == rs2_2) => {
             state.fusions += 1;
+            state.logicfusion += 1;
         },
 
         // Logic + ANDI (imm == 1)
@@ -208,6 +246,7 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
          ANDI { rd: rd2, rs1: rs1_2, imm: 1, .. })
             if rd1 == rd2 && rd2 == rs1_2 => {
             state.fusions += 1;
+            state.logicfusion += 1;
         },
 
         // Logic + ZEXT.H
@@ -216,8 +255,9 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
          ORC_B { rd: rd1, .. },
          ZEXT_H { rd: rd2, rs1: rs1_2, .. })
             if rd1 == rd2 && rd2 == rs1_2 => {
-            state.fusions += 1;1;
-        },
+                state.fusions += 1;
+                state.logicfusion += 1;
+            },
 
         // Load fusion (Pradyun-written code starts here again)
         (
@@ -250,7 +290,8 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
         }
 
         // Theoretical
-        (ADDI{ rd, rs1: rs1e, .. } | SLTI{ rd, rs1: rs1e, .. }  | ANDI{ rd, rs1: rs1e, .. } | SRAI{ rd, rs1: rs1e, .. },
+        (ADDI{ rd, rs1: rs1e, .. } | SLTI{ rd, rs1: rs1e, .. }  |
+         ANDI{ rd, rs1: rs1e, .. } | SRAI{ rd, rs1: rs1e, .. },
          // | ADD{ rd, .. } | SLT{ rd, .. } | AND{ rd, .. } | SUB{ rd, .. },
          BEQ { rs1, rs2, .. }  | BNE  { rs1, rs2, .. } |
          BLT  { rs1, rs2, .. } | BGE  { rs1, rs2, .. } | BLTU { rs1, rs2, .. } |
@@ -282,21 +323,17 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
 }
 
 
-const HANDLERS: &[fn(&mut TracerState, Option<&PitInst>, bool)] =
-    &[
-        inst_mix,
-        dfg_gen,
-        fusion_profiler
-    ];
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("[err] no file supplied");
-        return;
-    }
+    let mut handlers: Vec<fn(&mut TracerState, Option<&PitInst>, bool)> =
+        vec![
+            inst_mix,
+            dfg_gen,
+            fusion_profiler,
+        ];
+    let args = Args::parse();
 
-    let trace = match File::open(&args[1]) {
+    let trace = match File::open(&args.tracefile) {
         Err(_) => {
             eprintln!("[err] invalid tracefile");
             return;
@@ -309,7 +346,18 @@ fn main() {
     let target = Target::from_str("RV64IMAFDCZicsr_Zifencei_Zba_Zbb_Zbs_Zbkb")
         .unwrap().with_s_mode(true).with_privileged(true);
 
-    let mut state = TracerState::default();
+    let asm_range = match args.asm {
+        None => 0,
+        Some(x) => {
+            handlers.push(asm_dump);
+            x
+        }
+    };
+
+    let mut state = TracerState {
+        asm_range: asm_range,
+        ..Default::default()
+    };
 
     loop {
         let mut ibuf = [0u8; 4];
@@ -372,7 +420,7 @@ fn main() {
             return;
         }
 
-        for f in HANDLERS {
+        for f in &handlers {
             f(&mut state, Some(&pit_inst), false);
         }
     }
@@ -383,7 +431,7 @@ fn main() {
     println!("Vector Instructions: {} ({:.2}%)", state.vector,
              100.0 * (state.vector as f64) / (state.insts as f64));
 
-    for f in HANDLERS {
+    for f in &handlers {
         f(&mut state, None, true);
     }
 }
