@@ -1,5 +1,6 @@
 use clap::Parser;
 use riscv_isa::{self, Instruction::*, Target};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::str::FromStr;
 
@@ -9,12 +10,16 @@ struct Args {
     /// PIT trace file to analyze
     tracefile: String,
 
-    /// Enable DFG generation with the given window size
-    #[arg(long, value_name = "WINDOW")]
-    window: Option<u64>,
+    /// Enable DFG generation/analysis over a sliding window of WINSIZE instructions
+    #[arg(short = 'I', long, value_name = "WINSIZE")]
+    ilp_check: Option<u64>,
 
-    /// ASM analysis parameter
-    #[arg(short = 'A', long, value_name = "ASMDUMP")]
+    /// # of instructions to prune on WINSIZE
+    #[arg(short = 'P', long, value_name = "PRUNESIZE", default_value_t = 32)]
+    prune_size: u64,
+
+    /// Enable ASM dumping for DUMPLEN instructions
+    #[arg(short = 'A', long, value_name = "DUMPLEN")]
     asm: Option<u64>,
 }
 
@@ -65,6 +70,11 @@ struct TracerState {
     aqct: u64,
     rlct: u64,
     aqrlct: u64,
+
+    // dfg/ilp analyzer
+    winsize: usize,
+    prunesize: usize,
+    dfg_window: VecDeque<PitInst>,
 }
 
 fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
@@ -133,44 +143,11 @@ fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
             state.floatinsts += 1;
         }
 
-        if matches!(
-            p.inst,
-            ECALL
-                | EBREAK
-                | FENCE_I
-                | WFI
-                | CSRRW { .. }
-                | CSRRWI { .. }
-                | CSRRC { .. }
-                | CSRRCI { .. }
-                | CSRRS { .. }
-                | CSRRSI { .. }
-                | AMOSWAP_W { .. }
-                | AMOSWAP_D { .. }
-                | AMOADD_W { .. }
-                | AMOADD_D { .. }
-                | AMOXOR_W { .. }
-                | AMOXOR_D { .. }
-                | AMOAND_W { .. }
-                | AMOAND_D { .. }
-                | AMOOR_W { .. }
-                | AMOOR_D { .. }
-                | AMOMIN_W { .. }
-                | AMOMIN_D { .. }
-                | AMOMAX_W { .. }
-                | AMOMAX_D { .. }
-                | AMOMINU_W { .. }
-                | AMOMINU_D { .. }
-                | AMOMAXU_W { .. }
-                | AMOMAXU_D { .. }
-        ) {
+        if p.inst.misc() {
             state.miscinsts += 1;
         }
 
-        if matches!(
-            p.inst,
-            DIV { .. } | DIVU { .. } | DIVW { .. } | DIVUW { .. }
-        ) {
+        if p.inst.div() {
             state.divinsts += 1;
         }
 
@@ -265,7 +242,127 @@ fn amoprof(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
     }
 }
 
-fn dfg_gen(state: &mut TracerState, pkt: Option<&PitInst>, _: bool) {}
+fn dfg_gen(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
+    if !finish {
+        let isn = pkt.unwrap();
+
+        if state.winsize > 0 && state.dfg_window.len() >= state.winsize {
+            // 1: prune head of graph if too many insts
+            // Q: what should pruning size be? 1 inst may be too expensive
+            state.dfg_window.drain(..state.prunesize);
+        }
+
+        // 2: append new inst to graph
+        state.dfg_window.push_back(*isn);
+    }
+
+    if finish || state.dfg_window.len() == state.winsize {
+        // 3. do a DFG traversal here to find graph depth (and efffective ILP)
+        // MVP: only use data connectivity, not instruction timings
+        // Connection types: Int RF, Float RF, Control (to stores/misc/fence), Fence/AMO
+
+        // store vtick (virtual tick) here
+        let mut l_ctrl = 0;
+        let mut l_ser = 0;
+        let mut l_memser = 0;
+        let mut l_mem = 0;
+        let mut memticks: HashMap<u64, usize> = HashMap::new();
+        let mut intregdep = [0usize; 32];
+        let mut flregdep = [0usize; 32];
+
+        let mut maxtick = 0;
+
+        for pkt in &state.dfg_window {
+            let inst = &pkt.inst;
+
+            let mut vtick = 0;
+
+            // find dependencies to determine earliest possible tick
+            if let Some(rs1) = inst.get_rs1() {
+                vtick = vtick.max(intregdep[rs1 as usize]);
+            }
+
+            if let Some(rs2) = inst.get_rs2() {
+                vtick = vtick.max(intregdep[rs2 as usize]);
+            }
+
+            if let Some(frs1) = inst.get_frs1() {
+                vtick = vtick.max(flregdep[frs1 as usize]);
+            }
+
+            if let Some(frs2) = inst.get_frs2() {
+                vtick = vtick.max(flregdep[frs2 as usize]);
+            }
+
+            if let Some(frs3) = inst.get_frs3() {
+                vtick = vtick.max(flregdep[frs3 as usize]);
+            }
+
+            // non-reg dependencies
+            if inst.mem() {
+                let vaddr = pkt.addr.unwrap();
+                vtick = vtick.max(*memticks.get(&vaddr).unwrap_or(&0));
+
+                if inst.store() {
+                    vtick = vtick.max(l_ctrl); // stores drain after branches
+                }
+
+                vtick = vtick.max(l_memser);
+            }
+
+            if inst.misc() {
+                // be VERY conservative, just do it after everything else.
+                vtick = maxtick;
+            }
+
+            if matches!(inst, FENCE { .. }) {
+                vtick = vtick.max(l_mem);
+            }
+
+            vtick = vtick.max(l_ser); // all instructions wait on serialization, for now
+
+            vtick += 1; // earliest possible time of completion
+
+            // record this tick if it is the "youngest" completed inst
+            maxtick = maxtick.max(vtick);
+
+            // record this tick into dependency sources
+            if let Some(rd) = inst.get_rd() {
+                intregdep[rd as usize] = vtick;
+            }
+
+            if let Some(frd) = inst.get_frd() {
+                flregdep[frd as usize] = vtick;
+            }
+
+            if inst.branch() {
+                l_ctrl = l_ctrl.max(vtick);
+            }
+
+            if inst.mem() {
+                l_mem = l_mem.max(vtick);
+
+                let vaddr = pkt.addr.unwrap();
+                memticks.insert(vaddr, vtick);
+            }
+
+            if inst.misc() {
+                l_ser = vtick;
+            }
+
+            if matches!(inst, FENCE { .. }) {
+                l_memser = vtick;
+            }
+        }
+
+        let wlen = state.dfg_window.len();
+        println!(
+            "Window @ {}: {wlen} insts, {maxtick} ticks, ILP {:.2}",
+            state.insts,
+            wlen as f64 / maxtick as f64
+        );
+    }
+}
 
 fn asm_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
     if !finish && state.insts <= state.asm_range {
@@ -628,7 +725,7 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
 
 fn main() {
     let mut handlers: Vec<fn(&mut TracerState, Option<&PitInst>, bool)> =
-        vec![amoprof, inst_mix, dfg_gen, fusion_profiler];
+        vec![amoprof, inst_mix, fusion_profiler];
     let args = Args::parse();
 
     let trace = match File::open(&args.tracefile) {
@@ -654,7 +751,17 @@ fn main() {
         }
     };
 
+    let ilp_winsize = match args.ilp_check {
+        None => 0,
+        Some(x) => {
+            handlers.push(dfg_gen);
+            x
+        }
+    };
+
     let mut state = TracerState {
+        winsize: ilp_winsize as usize,
+        prunesize: args.prune_size as usize,
         asm_range: asm_range,
         ..Default::default()
     };
