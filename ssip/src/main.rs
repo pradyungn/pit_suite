@@ -21,6 +21,10 @@ struct Args {
     /// Enable ASM dumping for DUMPLEN instructions
     #[arg(short = 'A', long, value_name = "DUMPLEN")]
     asm: Option<u64>,
+
+    /// Verbose DFG output (prints per-instruction dependencies for the first window)
+    #[arg(short = 'V', long)]
+    verbose: bool,
 }
 
 use std::io::{BufReader, ErrorKind, Read};
@@ -74,6 +78,7 @@ struct TracerState {
     // dfg/ilp analyzer
     winsize: usize,
     prunesize: usize,
+    verbose: bool,
     dfg_window: VecDeque<PitInst>,
 }
 
@@ -257,111 +262,195 @@ fn dfg_gen(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
     }
 
     if finish || state.dfg_window.len() == state.winsize {
-        // 3. do a DFG traversal here to find graph depth (and efffective ILP)
-        // MVP: only use data connectivity, not instruction timings
-        // Connection types: Int RF, Float RF, Control (to stores/misc/fence), Fence/AMO
+        if state.verbose {
+            dfg_traverse_verbose(state);
+            state.verbose = false;
+        } else {
+            dfg_traverse(state);
+        }
+    }
+}
 
-        // store vtick (virtual tick) here
-        let mut l_ctrl = 0;
-        let mut l_ser = 0;
-        let mut l_memser = 0;
-        let mut l_mem = 0;
-        let mut memticks: HashMap<u64, usize> = HashMap::new();
-        let mut intregdep = [0usize; 32];
-        let mut flregdep = [0usize; 32];
+fn dfg_traverse(state: &TracerState) {
+    let mut l_ctrl = 0usize;
+    let mut l_ser = 0usize;
+    let mut l_memser = 0usize;
+    let mut l_mem = 0usize;
+    let mut memticks: HashMap<u64, usize> = HashMap::new();
+    let mut intregdep = [0usize; 32];
+    let mut flregdep = [0usize; 32];
+    let mut maxtick = 0;
 
-        let mut maxtick = 0;
+    for pkt in &state.dfg_window {
+        let inst = &pkt.inst;
+        let mut vtick = 0;
 
-        for pkt in &state.dfg_window {
-            let inst = &pkt.inst;
-
-            let mut vtick = 0;
-
-            // find dependencies to determine earliest possible tick
-            if let Some(rs1) = inst.get_rs1() {
-                vtick = vtick.max(intregdep[rs1 as usize]);
-            }
-
-            if let Some(rs2) = inst.get_rs2() {
-                vtick = vtick.max(intregdep[rs2 as usize]);
-            }
-
-            if let Some(frs1) = inst.get_frs1() {
-                vtick = vtick.max(flregdep[frs1 as usize]);
-            }
-
-            if let Some(frs2) = inst.get_frs2() {
-                vtick = vtick.max(flregdep[frs2 as usize]);
-            }
-
-            if let Some(frs3) = inst.get_frs3() {
-                vtick = vtick.max(flregdep[frs3 as usize]);
-            }
-
-            // non-reg dependencies
-            if inst.mem() {
-                let vaddr = pkt.addr.unwrap();
-                vtick = vtick.max(*memticks.get(&vaddr).unwrap_or(&0));
-
-                if inst.store() {
-                    vtick = vtick.max(l_ctrl); // stores drain after branches
-                }
-
-                vtick = vtick.max(l_memser);
-            }
-
-            if inst.misc() {
-                // be VERY conservative, just do it after everything else.
-                vtick = maxtick;
-            }
-
-            if matches!(inst, FENCE { .. }) {
-                vtick = vtick.max(l_mem);
-            }
-
-            vtick = vtick.max(l_ser); // all instructions wait on serialization, for now
-
-            vtick += 1; // earliest possible time of completion
-
-            // record this tick if it is the "youngest" completed inst
-            maxtick = maxtick.max(vtick);
-
-            // record this tick into dependency sources
-            if let Some(rd) = inst.get_rd() {
-                intregdep[rd as usize] = vtick;
-            }
-
-            if let Some(frd) = inst.get_frd() {
-                flregdep[frd as usize] = vtick;
-            }
-
-            if inst.branch() {
-                l_ctrl = l_ctrl.max(vtick);
-            }
-
-            if inst.mem() {
-                l_mem = l_mem.max(vtick);
-
-                let vaddr = pkt.addr.unwrap();
-                memticks.insert(vaddr, vtick);
-            }
-
-            if inst.misc() {
-                l_ser = vtick;
-            }
-
-            if matches!(inst, FENCE { .. }) {
-                l_memser = vtick;
-            }
+        if let Some(rs1) = inst.get_rs1() {
+            vtick = vtick.max(intregdep[rs1 as usize]);
+        }
+        if let Some(rs2) = inst.get_rs2() {
+            vtick = vtick.max(intregdep[rs2 as usize]);
+        }
+        if let Some(frs1) = inst.get_frs1() {
+            vtick = vtick.max(flregdep[frs1 as usize]);
+        }
+        if let Some(frs2) = inst.get_frs2() {
+            vtick = vtick.max(flregdep[frs2 as usize]);
+        }
+        if let Some(frs3) = inst.get_frs3() {
+            vtick = vtick.max(flregdep[frs3 as usize]);
         }
 
-        let wlen = state.dfg_window.len();
-        println!(
-            "Window @ {}: {wlen} insts, {maxtick} ticks, ILP {:.2}",
-            state.insts,
-            wlen as f64 / maxtick as f64
-        );
+        if inst.mem() {
+            let vaddr = pkt.addr.unwrap();
+            vtick = vtick.max(*memticks.get(&vaddr).unwrap_or(&0));
+            if inst.store() {
+                vtick = vtick.max(l_ctrl);
+            }
+            vtick = vtick.max(l_memser);
+        }
+        if inst.misc() {
+            vtick = maxtick;
+        }
+        if matches!(inst, FENCE { .. }) {
+            vtick = vtick.max(l_mem);
+        }
+        vtick = vtick.max(l_ser);
+        vtick += 1;
+        maxtick = maxtick.max(vtick);
+
+        if let Some(rd) = inst.get_rd() {
+            intregdep[rd as usize] = vtick;
+        }
+        if let Some(frd) = inst.get_frd() {
+            flregdep[frd as usize] = vtick;
+        }
+        if inst.branch() {
+            l_ctrl = l_ctrl.max(vtick);
+        }
+        if inst.mem() {
+            l_mem = l_mem.max(vtick);
+            let vaddr = pkt.addr.unwrap();
+            memticks.insert(vaddr, vtick);
+        }
+        if inst.misc() {
+            l_ser = vtick;
+        }
+        if matches!(inst, FENCE { .. }) {
+            l_memser = vtick;
+        }
     }
+
+    let wlen = state.dfg_window.len();
+    println!(
+        "Window @ {}: {wlen} insts, {maxtick} ticks, ILP {:.2}",
+        state.insts,
+        wlen as f64 / maxtick as f64
+    );
+}
+
+fn dfg_traverse_verbose(state: &TracerState) {
+    let none: usize = usize::MAX;
+    let mut l_ctrl = (0usize, none);
+    let mut l_ser = (0usize, none);
+    let mut l_memser = (0usize, none);
+    let mut l_mem = (0usize, none);
+    let mut memticks: HashMap<u64, (usize, usize)> = HashMap::new();
+    let mut intregdep = [(0usize, none); 32];
+    let mut flregdep = [(0usize, none); 32];
+    let mut maxtick = 0;
+
+    for (i, pkt) in state.dfg_window.iter().enumerate() {
+        let inst = &pkt.inst;
+        let mut vtick = 0;
+        let mut deps: Vec<(usize, &str)> = Vec::new();
+
+        if let Some(rs1) = inst.get_rs1() {
+            let (tick, prod) = intregdep[rs1 as usize];
+            if tick > vtick { vtick = tick; }
+            if prod != none { deps.push((prod, "rs1")); }
+        }
+        if let Some(rs2) = inst.get_rs2() {
+            let (tick, prod) = intregdep[rs2 as usize];
+            if tick > vtick { vtick = tick; }
+            if prod != none { deps.push((prod, "rs2")); }
+        }
+        if let Some(frs1) = inst.get_frs1() {
+            let (tick, prod) = flregdep[frs1 as usize];
+            if tick > vtick { vtick = tick; }
+            if prod != none { deps.push((prod, "frs1")); }
+        }
+        if let Some(frs2) = inst.get_frs2() {
+            let (tick, prod) = flregdep[frs2 as usize];
+            if tick > vtick { vtick = tick; }
+            if prod != none { deps.push((prod, "frs2")); }
+        }
+        if let Some(frs3) = inst.get_frs3() {
+            let (tick, prod) = flregdep[frs3 as usize];
+            if tick > vtick { vtick = tick; }
+            if prod != none { deps.push((prod, "frs3")); }
+        }
+
+        if inst.mem() {
+            let vaddr = pkt.addr.unwrap();
+            if let Some(&(tick, prod)) = memticks.get(&vaddr) {
+                if tick > vtick { vtick = tick; }
+                if prod != none { deps.push((prod, "mem")); }
+            }
+            if inst.store() {
+                if l_ctrl.0 > vtick { vtick = l_ctrl.0; }
+                if l_ctrl.1 != none { deps.push((l_ctrl.1, "ctrl")); }
+            }
+            if l_memser.0 > vtick { vtick = l_memser.0; }
+            if l_memser.1 != none { deps.push((l_memser.1, "memser")); }
+        }
+        if inst.misc() {
+            vtick = maxtick;
+            deps.push((i.wrapping_sub(1), "serialize"));
+        }
+        if matches!(inst, FENCE { .. }) {
+            if l_mem.0 > vtick { vtick = l_mem.0; }
+            if l_mem.1 != none { deps.push((l_mem.1, "fence")); }
+        }
+        if l_ser.0 > vtick { vtick = l_ser.0; }
+        if l_ser.1 != none { deps.push((l_ser.1, "ser")); }
+
+        vtick += 1;
+        maxtick = maxtick.max(vtick);
+
+        let dep_str: Vec<String> = deps.iter()
+            .map(|(prod, kind)| format!("#{prod}({kind})"))
+            .collect();
+        println!("  [{i}] {inst} @ tick {vtick} <- [{}]", dep_str.join(", "));
+
+        if let Some(rd) = inst.get_rd() {
+            intregdep[rd as usize] = (vtick, i);
+        }
+        if let Some(frd) = inst.get_frd() {
+            flregdep[frd as usize] = (vtick, i);
+        }
+        if inst.branch() {
+            if vtick > l_ctrl.0 { l_ctrl = (vtick, i); }
+        }
+        if inst.mem() {
+            if vtick > l_mem.0 { l_mem = (vtick, i); }
+            let vaddr = pkt.addr.unwrap();
+            memticks.insert(vaddr, (vtick, i));
+        }
+        if inst.misc() {
+            l_ser = (vtick, i);
+        }
+        if matches!(inst, FENCE { .. }) {
+            l_memser = (vtick, i);
+        }
+    }
+
+    let wlen = state.dfg_window.len();
+    println!(
+        "Window @ {}: {wlen} insts, {maxtick} ticks, ILP {:.2}",
+        state.insts,
+        wlen as f64 / maxtick as f64
+    );
 }
 
 fn asm_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
@@ -762,6 +851,7 @@ fn main() {
     let mut state = TracerState {
         winsize: ilp_winsize as usize,
         prunesize: args.prune_size as usize,
+        verbose: args.verbose,
         asm_range: asm_range,
         ..Default::default()
     };
