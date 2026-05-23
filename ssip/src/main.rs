@@ -65,7 +65,7 @@ struct TracerState {
     alujalr: u64,
     constbr: u64,
     alubranch_dist: u64,
-    alubranch_dist_tot: u64,
+    alubranch_dists: Vec<u64>,
 
     // amo profiler
     lrct: u64,
@@ -503,10 +503,27 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
             100.0 * (state.alujalr as f64) / (state.ctrlinsts as f64)
         );
 
-        println!(
-            "Average Distance for ALUBR: {:.2}",
-            (state.alubranch_dist_tot as f64) / (state.alubranch as f64)
-        );
+        if state.alubranch_dists.is_empty() {
+            println!("ALUBR Distance: no samples");
+        } else {
+            let mut sorted = state.alubranch_dists.clone();
+            sorted.sort_unstable();
+            let pct = |p: f64| -> f64 {
+                let n = sorted.len();
+                let pos = p * (n - 1) as f64;
+                let lo = pos.floor() as usize;
+                let hi = pos.ceil() as usize;
+                let frac = pos - lo as f64;
+                sorted[lo] as f64 + frac * (sorted[hi] as f64 - sorted[lo] as f64)
+            };
+            println!(
+                "ALUBR Distance (n={}): Q1={:.2}, median={:.2}, Q3={:.2}",
+                sorted.len(),
+                pct(0.25),
+                pct(0.50),
+                pct(0.75)
+            );
+        }
         return;
     }
 
@@ -787,7 +804,10 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
             state.fusions += 1;
             state.alubranch += 1;
 
-            state.alubranch_dist_tot += state.alubranch_dist;
+            if state.alubranch > 1 {
+                state.alubranch_dists.push(state.alubranch_dist);
+            }
+
             state.alubranch_dist = 0;
 
             if rs1e == 0 {
