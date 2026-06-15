@@ -870,8 +870,18 @@ fn asm_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
         }
 
         print!("{}", pkt.unwrap().inst);
+
+        if pkt.unwrap().compressed {
+            print!(" [c]");
+        }
+
         match pkt.unwrap().addr {
-            Some(x) => println!(" [0x{:08x}]", x),
+            Some(x) =>
+                if pkt.unwrap().inst.mem() {
+                    println!(" [0x{:08x}]", x)
+                } else {
+                    println!(" [0x{:08x} -> 0x{:08x}]", state.pc, x)
+                },
             None => println!(""),
         };
     }
@@ -1469,14 +1479,6 @@ fn main() {
         trace_insts += 1;
         state.insts += 1;
 
-        if args.pc_annot {
-            if (inst.branch() || inst.trap()) {
-                state.pc = pit_inst.addr.unwrap();
-            } else {
-                state.pc += bytes as u64;
-            }
-        }
-
         if bytes == 2 {
             state.compressed += 1;
         } else if bytes != 4 {
@@ -1486,6 +1488,14 @@ fn main() {
 
         for f in &handlers {
             f(&mut state, Some(&pit_inst), false);
+        }
+
+        if args.pc_annot {
+            if inst.branch() || inst.trap() {
+                state.pc = pit_inst.addr.unwrap();
+            } else {
+                state.pc += bytes as u64;
+            }
         }
 
         if args.warmup > 0 && trace_insts == args.warmup {
