@@ -1,3 +1,4 @@
 #include <common.h>
+#include <cpu/decode.h>
 
-void pit(pitPacket pkt, bool mem);
+void pit(Decode*, uint64_t, bool);

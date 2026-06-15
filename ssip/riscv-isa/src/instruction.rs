@@ -349,6 +349,16 @@ impl Instruction {
         )
     }
 
+    pub fn trap(&self) -> bool {
+        matches!(
+            self,
+            Instruction::MRET |
+            Instruction::SRET |
+            Instruction::ECALL {..} |
+            Instruction:: EBREAK
+        )
+    }
+
     pub fn mem(&self) -> bool {
         (matches!(self, Instruction::CBO) || self.load() || self.store())
     }

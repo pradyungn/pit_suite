@@ -15,16 +15,34 @@ struct Args {
     ilp_check: Option<u64>,
 
     /// # of instructions to prune on WINSIZE
-    #[arg(short = 'P', long, value_name = "PRUNESIZE", default_value_t = 32)]
+    #[arg(short = 'X', long, value_name = "PRUNESIZE", default_value_t = 32)]
     prune_size: u64,
 
     /// Enable ASM dumping for DUMPLEN instructions
     #[arg(short = 'A', long, value_name = "DUMPLEN")]
     asm: Option<u64>,
 
+    /// Enable D-cache simulation; optional value is SIZE,LINE_SIZE,WAYS[,POLICY]
+    #[arg(
+        long,
+        value_name = "SIZE,LINE_SIZE,WAYS[,POLICY]",
+        num_args = 0..=1,
+        default_missing_value = "32768,64,8,tree-plru",
+        require_equals = true
+    )]
+    dcache: Option<String>,
+
+    /// Number of decoded instructions to process as warmup before resetting all profiler stats
+    #[arg(long, value_name = "INSTS", default_value_t = 0)]
+    warmup: u64,
+
     /// Verbose DFG output (prints per-instruction dependencies for the first window)
     #[arg(short = 'V', long)]
     verbose: bool,
+
+    /// If trace has PC annotations, collect that too
+    #[arg(short = 'P', long)]
+    pc_annot: bool,
 }
 
 use std::io::{BufReader, ErrorKind, Read};
@@ -33,6 +51,311 @@ use std::io::{BufReader, ErrorKind, Read};
 struct PitInst {
     inst: riscv_isa::Instruction,
     addr: Option<u64>,
+    compressed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplacementPolicy {
+    Lru,
+    TreePlru,
+}
+
+impl ReplacementPolicy {
+    fn parse(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        let normalized = trimmed
+            .to_ascii_lowercase()
+            .replace('_', "")
+            .replace('-', "");
+
+        match normalized.as_str() {
+            "lru" | "truelru" => Ok(Self::Lru),
+            "treeplru" | "treeplrurp" | "treelru" | "treelrurp" | "treepseudolru" => {
+                Ok(Self::TreePlru)
+            }
+            _ => Err(format!(
+                "invalid replacement policy `{trimmed}`; expected `lru` or `tree-plru`"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Lru => "lru",
+            Self::TreePlru => "tree-plru",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CacheConfig {
+    size: usize,
+    line_size: usize,
+    ways: usize,
+    sets: usize,
+    replacement: ReplacementPolicy,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CacheLine {
+    valid: bool,
+    tag: u64,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct CacheStats {
+    accesses: u64,
+    hits: u64,
+    misses: u64,
+}
+
+struct CacheSet {
+    lines: Vec<CacheLine>,
+    replacement: ReplacementState,
+}
+
+enum ReplacementState {
+    Lru,
+    TreePlru { bits: Vec<bool> },
+}
+
+impl CacheSet {
+    fn new(ways: usize, replacement: ReplacementPolicy) -> Self {
+        let replacement = match replacement {
+            ReplacementPolicy::Lru => ReplacementState::Lru,
+            ReplacementPolicy::TreePlru => ReplacementState::TreePlru {
+                bits: vec![false; ways - 1],
+            },
+        };
+
+        Self {
+            lines: vec![CacheLine::default(); ways],
+            replacement,
+        }
+    }
+
+    fn touch(&mut self, way: usize, timestamp: u64) {
+        self.lines[way].last_used = timestamp;
+
+        match &mut self.replacement {
+            ReplacementState::Lru => (),
+            ReplacementState::TreePlru { bits } => tree_plru_touch(bits, self.lines.len(), way),
+        }
+    }
+
+    fn victim(&self) -> usize {
+        if let Some(invalid) = self.lines.iter().position(|line| !line.valid) {
+            return invalid;
+        }
+
+        match &self.replacement {
+            ReplacementState::Lru => {
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, line)| line.last_used)
+                    .unwrap()
+                    .0
+            }
+            ReplacementState::TreePlru { bits } => tree_plru_victim(bits, self.lines.len()),
+        }
+    }
+}
+
+struct CacheModel {
+    cfg: CacheConfig,
+    sets: Vec<CacheSet>,
+    stats: CacheStats,
+    timestamp: u64,
+}
+
+impl CacheModel {
+    fn new(
+        size: usize,
+        line_size: usize,
+        ways: usize,
+        replacement: ReplacementPolicy,
+    ) -> Result<Self, String> {
+        if size == 0 {
+            return Err("size must be non-zero".to_string());
+        }
+        if line_size == 0 {
+            return Err("line size must be non-zero".to_string());
+        }
+        if ways == 0 {
+            return Err("associativity must be non-zero".to_string());
+        }
+        if replacement == ReplacementPolicy::TreePlru && !ways.is_power_of_two() {
+            return Err("tree-plru associativity must be a power of two".to_string());
+        }
+        if size % line_size != 0 {
+            return Err("size must be a multiple of line size".to_string());
+        }
+
+        let lines = size / line_size;
+        if lines == 0 {
+            return Err("cache must contain at least one line".to_string());
+        }
+        if lines % ways != 0 {
+            return Err("number of lines must be a multiple of associativity".to_string());
+        }
+
+        let sets = lines / ways;
+        let cfg = CacheConfig {
+            size,
+            line_size,
+            ways,
+            sets,
+            replacement,
+        };
+
+        Ok(Self {
+            cfg,
+            sets: (0..sets)
+                .map(|_| CacheSet::new(ways, replacement))
+                .collect(),
+            stats: CacheStats::default(),
+            timestamp: 0,
+        })
+    }
+
+    fn from_spec(spec: &str, default_replacement: ReplacementPolicy) -> Result<Self, String> {
+        let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
+        if !(3..=4).contains(&parts.len()) {
+            return Err("expected SIZE,LINE_SIZE,WAYS[,POLICY]".to_string());
+        }
+
+        let size = parse_cache_usize(parts[0], "size")?;
+        let line_size = parse_cache_usize(parts[1], "line size")?;
+        let ways = parse_cache_usize(parts[2], "associativity")?;
+        let replacement = if parts.len() == 4 {
+            ReplacementPolicy::parse(parts[3])?
+        } else {
+            default_replacement
+        };
+
+        Self::new(size, line_size, ways, replacement)
+    }
+
+    fn reset_stats(&mut self) {
+        self.stats = CacheStats::default();
+    }
+
+    fn access(&mut self, addr: u64) -> bool {
+        self.stats.accesses += 1;
+        self.timestamp += 1;
+
+        let line_addr = addr / (self.cfg.line_size as u64);
+        let set_idx = (line_addr % (self.cfg.sets as u64)) as usize;
+        let tag = line_addr / (self.cfg.sets as u64);
+        let set = &mut self.sets[set_idx];
+
+        if let Some(hit_idx) = set
+            .lines
+            .iter()
+            .position(|line| line.valid && line.tag == tag)
+        {
+            self.stats.hits += 1;
+            set.touch(hit_idx, self.timestamp);
+            return true;
+        }
+
+        self.stats.misses += 1;
+        let replace_idx = set.victim();
+        set.lines[replace_idx] = CacheLine {
+            valid: true,
+            tag,
+            last_used: 0,
+        };
+        set.touch(replace_idx, self.timestamp);
+
+        false
+    }
+
+    fn print_stats(&self, name: &str) {
+        println!("--- {name} ---");
+        println!(
+            "Config: {} B, {} B lines, {}-way, {} sets, {} replacement",
+            self.cfg.size,
+            self.cfg.line_size,
+            self.cfg.ways,
+            self.cfg.sets,
+            self.cfg.replacement.name()
+        );
+        println!("Accesses: {}", self.stats.accesses);
+
+        let hit_rate = pct(self.stats.hits, self.stats.accesses);
+        let miss_rate = pct(self.stats.misses, self.stats.accesses);
+        println!("Hits: {} ({hit_rate:.2}%)", self.stats.hits);
+        println!("Misses: {} ({miss_rate:.2}%)", self.stats.misses);
+    }
+}
+
+fn tree_plru_touch(bits: &mut [bool], ways: usize, way: usize) {
+    let mut node = 0;
+    let mut base_way = 0;
+    let mut span = ways;
+
+    while node < bits.len() {
+        let half = span / 2;
+        let split = base_way + half;
+
+        if way < split {
+            // Bit values point toward the victim subtree. Touching the left
+            // subtree makes the right subtree the next PLRU candidate.
+            bits[node] = true;
+            node = 2 * node + 1;
+        } else {
+            // Touching the right subtree makes the left subtree the next PLRU
+            // candidate.
+            bits[node] = false;
+            node = 2 * node + 2;
+            base_way = split;
+        }
+
+        span = half;
+    }
+}
+
+fn tree_plru_victim(bits: &[bool], ways: usize) -> usize {
+    let mut node = 0;
+    let mut victim = 0;
+    let mut span = ways;
+
+    while node < bits.len() {
+        let half = span / 2;
+
+        if bits[node] {
+            victim += half;
+            node = 2 * node + 2;
+        } else {
+            node = 2 * node + 1;
+        }
+
+        span = half;
+    }
+
+    victim
+}
+
+fn parse_cache_usize(value: &str, name: &str) -> Result<usize, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{name} is empty"));
+    }
+
+    trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {name}: `{trimmed}`"))
+}
+
+fn pct(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        100.0 * (part as f64) / (total as f64)
+    }
 }
 
 #[derive(Default)]
@@ -42,11 +365,15 @@ struct TracerState {
     compressed: u64,
     vector: u64,
 
+    pc_annot: bool,
+    pc: u64,
+
     // inst mix
     meminsts: u64,
     loadinsts: u64,
     storeinsts: u64,
     ctrlinsts: u64,
+    trapinsts: u64,
     floatinsts: u64,
     miscinsts: u64,
     divinsts: u64,
@@ -80,6 +407,35 @@ struct TracerState {
     prunesize: usize,
     verbose: bool,
     dfg_window: VecDeque<PitInst>,
+
+    // cache models
+    dcache: Option<CacheModel>,
+}
+
+impl TracerState {
+    fn reset_for_measurement(&mut self, verbose: bool) {
+        let winsize = self.winsize;
+        let prunesize = self.prunesize;
+        let asm_range = self.asm_range;
+        let pc_annot = self.pc_annot;
+        let pc = self.pc;
+        let mut dcache = self.dcache.take();
+
+        if let Some(dcache) = dcache.as_mut() {
+            dcache.reset_stats();
+        }
+
+        *self = Self {
+            pc_annot,
+            pc,
+            winsize,
+            prunesize,
+            verbose,
+            asm_range,
+            dcache,
+            ..Default::default()
+        };
+    }
 }
 
 fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
@@ -104,6 +460,11 @@ fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
             "Control Instructions: {} ({:.2}%)",
             state.ctrlinsts,
             100.0 * (state.ctrlinsts as f64) / (state.insts as f64)
+        );
+        println!(
+            "Trap Instructions: {} ({:.2}%)",
+            state.trapinsts,
+            100.0 * (state.trapinsts as f64) / (state.insts as f64)
         );
         println!(
             "Float Instructions: {} ({:.2}%)",
@@ -142,6 +503,10 @@ fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
 
         if p.inst.branch() {
             state.ctrlinsts += 1;
+        }
+
+        if p.inst.trap() {
+            state.trapinsts += 1;
         }
 
         if p.inst.float() {
@@ -367,58 +732,99 @@ fn dfg_traverse_verbose(state: &TracerState) {
 
         if let Some(rs1) = inst.get_rs1() {
             let (tick, prod) = intregdep[rs1 as usize];
-            if tick > vtick { vtick = tick; }
-            if prod != none { deps.push((prod, "rs1")); }
+            if tick > vtick {
+                vtick = tick;
+            }
+            if prod != none {
+                deps.push((prod, "rs1"));
+            }
         }
         if let Some(rs2) = inst.get_rs2() {
             let (tick, prod) = intregdep[rs2 as usize];
-            if tick > vtick { vtick = tick; }
-            if prod != none { deps.push((prod, "rs2")); }
+            if tick > vtick {
+                vtick = tick;
+            }
+            if prod != none {
+                deps.push((prod, "rs2"));
+            }
         }
         if let Some(frs1) = inst.get_frs1() {
             let (tick, prod) = flregdep[frs1 as usize];
-            if tick > vtick { vtick = tick; }
-            if prod != none { deps.push((prod, "frs1")); }
+            if tick > vtick {
+                vtick = tick;
+            }
+            if prod != none {
+                deps.push((prod, "frs1"));
+            }
         }
         if let Some(frs2) = inst.get_frs2() {
             let (tick, prod) = flregdep[frs2 as usize];
-            if tick > vtick { vtick = tick; }
-            if prod != none { deps.push((prod, "frs2")); }
+            if tick > vtick {
+                vtick = tick;
+            }
+            if prod != none {
+                deps.push((prod, "frs2"));
+            }
         }
         if let Some(frs3) = inst.get_frs3() {
             let (tick, prod) = flregdep[frs3 as usize];
-            if tick > vtick { vtick = tick; }
-            if prod != none { deps.push((prod, "frs3")); }
+            if tick > vtick {
+                vtick = tick;
+            }
+            if prod != none {
+                deps.push((prod, "frs3"));
+            }
         }
 
         if inst.mem() {
             let vaddr = pkt.addr.unwrap();
             if let Some(&(tick, prod)) = memticks.get(&vaddr) {
-                if tick > vtick { vtick = tick; }
-                if prod != none { deps.push((prod, "mem")); }
+                if tick > vtick {
+                    vtick = tick;
+                }
+                if prod != none {
+                    deps.push((prod, "mem"));
+                }
             }
             if inst.store() {
-                if l_ctrl.0 > vtick { vtick = l_ctrl.0; }
-                if l_ctrl.1 != none { deps.push((l_ctrl.1, "ctrl")); }
+                if l_ctrl.0 > vtick {
+                    vtick = l_ctrl.0;
+                }
+                if l_ctrl.1 != none {
+                    deps.push((l_ctrl.1, "ctrl"));
+                }
             }
-            if l_memser.0 > vtick { vtick = l_memser.0; }
-            if l_memser.1 != none { deps.push((l_memser.1, "memser")); }
+            if l_memser.0 > vtick {
+                vtick = l_memser.0;
+            }
+            if l_memser.1 != none {
+                deps.push((l_memser.1, "memser"));
+            }
         }
         if inst.misc() {
             vtick = maxtick;
             deps.push((i.wrapping_sub(1), "serialize"));
         }
         if matches!(inst, FENCE { .. }) {
-            if l_mem.0 > vtick { vtick = l_mem.0; }
-            if l_mem.1 != none { deps.push((l_mem.1, "fence")); }
+            if l_mem.0 > vtick {
+                vtick = l_mem.0;
+            }
+            if l_mem.1 != none {
+                deps.push((l_mem.1, "fence"));
+            }
         }
-        if l_ser.0 > vtick { vtick = l_ser.0; }
-        if l_ser.1 != none { deps.push((l_ser.1, "ser")); }
+        if l_ser.0 > vtick {
+            vtick = l_ser.0;
+        }
+        if l_ser.1 != none {
+            deps.push((l_ser.1, "ser"));
+        }
 
         vtick += 1;
         maxtick = maxtick.max(vtick);
 
-        let dep_str: Vec<String> = deps.iter()
+        let dep_str: Vec<String> = deps
+            .iter()
             .map(|(prod, kind)| format!("#{prod}({kind})"))
             .collect();
         println!("  [{i}] {inst} @ tick {vtick} <- [{}]", dep_str.join(", "));
@@ -430,10 +836,14 @@ fn dfg_traverse_verbose(state: &TracerState) {
             flregdep[frd as usize] = (vtick, i);
         }
         if inst.branch() {
-            if vtick > l_ctrl.0 { l_ctrl = (vtick, i); }
+            if vtick > l_ctrl.0 {
+                l_ctrl = (vtick, i);
+            }
         }
         if inst.mem() {
-            if vtick > l_mem.0 { l_mem = (vtick, i); }
+            if vtick > l_mem.0 {
+                l_mem = (vtick, i);
+            }
             let vaddr = pkt.addr.unwrap();
             memticks.insert(vaddr, (vtick, i));
         }
@@ -455,11 +865,33 @@ fn dfg_traverse_verbose(state: &TracerState) {
 
 fn asm_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
     if !finish && state.insts <= state.asm_range {
+        if state.pc_annot && state.insts == 1 {
+            println!("start @ 0x{:08x}", state.pc);
+        }
+
         print!("{}", pkt.unwrap().inst);
         match pkt.unwrap().addr {
             Some(x) => println!(" [0x{:08x}]", x),
             None => println!(""),
         };
+    }
+}
+
+fn dcache_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
+    if finish {
+        if let Some(dcache) = &state.dcache {
+            dcache.print_stats("DCache");
+        }
+        return;
+    }
+
+    let pkt = pkt.unwrap();
+    if !(pkt.inst.load() || pkt.inst.store()) {
+        return;
+    }
+
+    if let (Some(dcache), Some(addr)) = (state.dcache.as_mut(), pkt.addr) {
+        dcache.access(addr);
     }
 }
 
@@ -522,6 +954,11 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
                 pct(0.25),
                 pct(0.50),
                 pct(0.75)
+            );
+            println!(
+                "ALUBR Distance: mean={:.2}, 5-pct={:.2}",
+                (sorted.iter().sum::<u64>() as f64) / (sorted.len() as f64),
+                pct(0.05)
             );
         }
         return;
@@ -813,6 +1250,15 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
             if rs1e == 0 {
                 state.constbr += 1;
             }
+
+            // let cur = pkt.unwrap();
+            // let comp_tag = match (lastinst.compressed, cur.compressed) {
+            //     (true, true) => "both compressed",
+            //     (true, false) => "first compressed",
+            //     (false, true) => "second compressed",
+            //     (false, false) => "neither compressed",
+            // };
+            // println!("[fusion] {} | {} ({})", lastinst.inst, inst, comp_tag);
         }
 
         (AUIPC { rd, .. } | LUI { rd, .. } | ADDI { rd, .. }, JALR { rd: rd2, rs1, .. })
@@ -830,6 +1276,32 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
 
     // if fusion successful, don't use lastinst/inst for another fusion
     state.lastinst = None;
+}
+
+fn dump_stats(
+    state: &mut TracerState,
+    handlers: &[fn(&mut TracerState, Option<&PitInst>, bool)],
+    label: Option<&str>,
+) {
+    if let Some(label) = label {
+        println!("=== {label} ===");
+    }
+
+    println!("Total Decoded Instructions: {}", state.insts);
+    println!(
+        "Compressed Instructions: {} ({:.2}%)",
+        state.compressed,
+        100.0 * (state.compressed as f64) / (state.insts as f64)
+    );
+    println!(
+        "Vector Instructions: {} ({:.2}%)",
+        state.vector,
+        100.0 * (state.vector as f64) / (state.insts as f64)
+    );
+
+    for f in handlers {
+        f(state, None, true);
+    }
 }
 
 fn main() {
@@ -868,13 +1340,47 @@ fn main() {
         }
     };
 
+    let dcache = match args.dcache.as_deref() {
+        None => None,
+        Some(spec) => match CacheModel::from_spec(spec, ReplacementPolicy::TreePlru) {
+            Ok(cache) => {
+                handlers.push(dcache_profiler);
+                Some(cache)
+            }
+            Err(e) => {
+                eprintln!("[err] invalid dcache config: {e}");
+                return;
+            }
+        },
+    };
+
+    // read out the starting PC on annotated traces
+    let start_pc = if args.pc_annot {
+        let mut start_pcbuf = [0u8; 8];
+
+        match tracereader.read_exact(&mut start_pcbuf) {
+            Err(e) => {
+                eprintln!("[err] encountered {} on parsing start pc", e.kind());
+                return;
+            }
+
+            Ok(_) => u64::from_le_bytes(start_pcbuf)
+        }
+    } else { 0u64 };
+
     let mut state = TracerState {
+        pc_annot: args.pc_annot,
+        pc: start_pc,
+
         winsize: ilp_winsize as usize,
         prunesize: args.prune_size as usize,
         verbose: args.verbose,
         asm_range: asm_range,
+        dcache,
         ..Default::default()
     };
+    let mut trace_insts = 0u64;
+    let mut warmup_complete = args.warmup == 0;
 
     loop {
         let mut ibuf = [0u8; 4];
@@ -883,7 +1389,7 @@ fn main() {
 
             Err(e) => {
                 eprintln!("[err] encountered {} on parsing", e.kind());
-                return;
+                break;
             }
 
             Ok(_) => (),
@@ -911,6 +1417,26 @@ fn main() {
                     Ok(_) => PitInst {
                         inst: inst,
                         addr: Some(u64::from_le_bytes(maddr)),
+                        compressed: bytes == 2,
+                    },
+                }
+            }
+
+            _ if args.pc_annot &&
+                (inst.branch() ||
+                 inst.trap()) => {
+                let mut npc = [0u8; 8];
+
+                match tracereader.read_exact(&mut npc) {
+                    Err(e) => {
+                        eprintln!("[err] encountered {} on parsing a pc annotation", e.kind());
+                        return;
+                    }
+
+                    Ok(_) => PitInst {
+                        inst: inst,
+                        addr: Some(u64::from_le_bytes(npc)),
+                        compressed: bytes == 2,
                     },
                 }
             }
@@ -923,22 +1449,34 @@ fn main() {
                     println!(
                         "[inf] unsupported instr: 0x{:08x} @ order {}",
                         u32::from_le_bytes(ibuf),
-                        state.insts
+                        trace_insts
                     );
                 }
                 PitInst {
                     inst: inst,
                     addr: None,
+                    compressed: bytes == 2,
                 }
             }
 
             _ => PitInst {
                 inst: inst,
                 addr: None,
+                compressed: bytes == 2,
             },
         };
 
+        trace_insts += 1;
         state.insts += 1;
+
+        if args.pc_annot {
+            if (inst.branch() || inst.trap()) {
+                state.pc = pit_inst.addr.unwrap();
+            } else {
+                state.pc += bytes as u64;
+            }
+        }
+
         if bytes == 2 {
             state.compressed += 1;
         } else if bytes != 4 {
@@ -949,21 +1487,30 @@ fn main() {
         for f in &handlers {
             f(&mut state, Some(&pit_inst), false);
         }
+
+        if args.warmup > 0 && trace_insts == args.warmup {
+            dump_stats(&mut state, &handlers, Some("Warmup Statistics"));
+            state.reset_for_measurement(args.verbose);
+            warmup_complete = true;
+        }
     }
 
-    println!("Total Decoded Instructions: {}", state.insts);
-    println!(
-        "Compressed Instructions: {} ({:.2}%)",
-        state.compressed,
-        100.0 * (state.compressed as f64) / (state.insts as f64)
-    );
-    println!(
-        "Vector Instructions: {} ({:.2}%)",
-        state.vector,
-        100.0 * (state.vector as f64) / (state.insts as f64)
-    );
-
-    for f in &handlers {
-        f(&mut state, None, true);
+    if args.warmup > 0 && !warmup_complete {
+        dump_stats(&mut state, &handlers, Some("Warmup Statistics"));
+        eprintln!("[inf] trace ended before warmup completed; no measurement statistics emitted");
+        return;
     }
+
+    if args.warmup > 0 && state.insts == 0 {
+        println!("=== Measurement Statistics ===");
+        println!("[inf] no instructions after warmup");
+        return;
+    }
+
+    let final_label = if args.warmup > 0 {
+        Some("Measurement Statistics")
+    } else {
+        None
+    };
+    dump_stats(&mut state, &handlers, final_label);
 }

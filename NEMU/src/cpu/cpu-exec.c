@@ -473,16 +473,14 @@ static void execute(int n) {
     // Most of executed instruction (except some priv instructions) will goto here.
     // Don't put Log here to improve performance
 
-    is_ctrl = false;
     Logti("prev pc = 0x%lx, pc = 0x%lx", prev_s->pc, s->pc);
 
     IFDEF(CONFIG_INSTR_CNT_BY_INSTR, g_nr_guest_instr += 1);
     IFDEF(CONFIG_INSTR_CNT_BY_INSTR, n_remain -= 1);
 
     debug_difftest(this_s, s);
-
-    pit((pitPacket){.instr = pit_ptr->isa.instr.val,
-                      .memaddr = pit_ptr->maddr}, pit_ptr->is_mem);
+    pit(pit_ptr, s->pc, is_ctrl);
+    is_ctrl = false;
 
     save_globals(s);
   }
@@ -513,8 +511,7 @@ end_of_loop:
 
   debug_difftest(this_s, s);
 
-  pit((pitPacket){ .instr = pit_ptr->isa.instr.val,
-                     .memaddr = pit_ptr->maddr }, pit_ptr->is_mem);
+  pit(pit_ptr, s->pc, is_ctrl);
   save_globals(s);
 }
 #else // CONFIG_PERF_OPT
