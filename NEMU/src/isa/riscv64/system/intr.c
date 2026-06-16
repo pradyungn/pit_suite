@@ -15,6 +15,7 @@
 ***************************************************************************************/
 
 #include <cpu/difftest.h>
+#include <pit.h>
 #include "../local-include/trigger.h"
 #include "../local-include/csr.h"
 #include "../local-include/intr.h"
@@ -336,6 +337,9 @@ word_t raise_intr(word_t NO, vaddr_t epc) {
 #endif //CONFIG_RV_SMRNMI
   update_mmu_state();
   clear_trapinfo();
+
+  // record redirect into PIT trace
+  redirect_pit(trap_pc);
   return trap_pc;
 }
 

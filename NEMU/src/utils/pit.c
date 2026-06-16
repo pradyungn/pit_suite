@@ -29,50 +29,15 @@ void drain_pit() {
   pitptr = 0;
 }
 
-// CHATGPT test function
-bool is_mem_access(uint32_t instr)
-{
-    /* Compressed? (bits [1:0] != 3) */
-    if ((instr & 3) != 3) {
-        unsigned quadrant = instr & 3;
-        unsigned funct3   = (instr >> 13) & 7;
+void redirect_pit(uint64_t redir_pc) {
+  if (pit_fp) {
+    if (pitcount <= warmup_interval) return;
 
-        /* Quadrant 0 (..00) */
-        if (quadrant == 0) {
-            if (funct3 == 2 ||  /* C.LW   */
-                funct3 == 6 ||  /* C.SW   */
-                funct3 == 1 ||  /* C.FLD  */
-                funct3 == 3 ||  /* C.FLW  */
-                funct3 == 7 ||  /* C.FSW  */
-                funct3 == 5)    /* C.FSD  */
-                return true;
-        }
-
-        /* Quadrant 2 (..10) */
-        if (quadrant == 2) {
-            if (funct3 == 2 ||  /* C.LWSP   */
-                funct3 == 6 ||  /* C.SWSP   */
-                funct3 == 1 ||  /* C.FLDSP  */
-                funct3 == 5 ||   /* C.FSDSP  */
-                funct3 == 3 ||   /* C.FLWSP  */
-                funct3 == 7)
-                return true;
-        }
-
-        return false;
-    }
-
-    /* Standard 32-bit opcode */
-    unsigned opcode = instr & 0x7F;
-
-    if (opcode == 3  ||  /* LOAD */
-        opcode == 35 ||  /* STORE */
-        opcode == 7  ||  /* LOAD_FP */
-        opcode == 39 ||  /* STORE_FP */
-        opcode == 47)    /* AMO */
-        return true;
-
-    return false;
+    drain_pit();
+    uint32_t magic_inst = 0xb;
+    fwrite(&magic_inst, sizeof(uint32_t), 1, pit_fp);
+    fwrite(&redir_pc, sizeof(uint64_t), 1, pit_fp);
+  }
 }
 
 void pit(Decode *pkt, uint64_t next_pc, bool is_ctrl) {

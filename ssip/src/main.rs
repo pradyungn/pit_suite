@@ -1,7 +1,13 @@
+mod cache;
+mod state;
+
+use cache::{CacheModel, ReplacementPolicy};
 use clap::Parser;
 use riscv_isa::{self, Instruction::*, Target};
-use std::collections::{HashMap, VecDeque};
+use state::{PitInst, TracerState};
+use std::collections::HashMap;
 use std::fs::File;
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::str::FromStr;
 
 #[derive(Parser)]
@@ -43,399 +49,10 @@ struct Args {
     /// If trace has PC annotations, collect that too
     #[arg(short = 'P', long)]
     pc_annot: bool,
-}
 
-use std::io::{BufReader, ErrorKind, Read};
-
-#[derive(Clone, Copy)]
-struct PitInst {
-    inst: riscv_isa::Instruction,
-    addr: Option<u64>,
-    compressed: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReplacementPolicy {
-    Lru,
-    TreePlru,
-}
-
-impl ReplacementPolicy {
-    fn parse(value: &str) -> Result<Self, String> {
-        let trimmed = value.trim();
-        let normalized = trimmed
-            .to_ascii_lowercase()
-            .replace('_', "")
-            .replace('-', "");
-
-        match normalized.as_str() {
-            "lru" | "truelru" => Ok(Self::Lru),
-            "treeplru" | "treeplrurp" | "treelru" | "treelrurp" | "treepseudolru" => {
-                Ok(Self::TreePlru)
-            }
-            _ => Err(format!(
-                "invalid replacement policy `{trimmed}`; expected `lru` or `tree-plru`"
-            )),
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Lru => "lru",
-            Self::TreePlru => "tree-plru",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CacheConfig {
-    size: usize,
-    line_size: usize,
-    ways: usize,
-    sets: usize,
-    replacement: ReplacementPolicy,
-}
-
-#[derive(Clone, Copy, Default)]
-struct CacheLine {
-    valid: bool,
-    tag: u64,
-    last_used: u64,
-}
-
-#[derive(Default)]
-struct CacheStats {
-    accesses: u64,
-    hits: u64,
-    misses: u64,
-}
-
-struct CacheSet {
-    lines: Vec<CacheLine>,
-    replacement: ReplacementState,
-}
-
-enum ReplacementState {
-    Lru,
-    TreePlru { bits: Vec<bool> },
-}
-
-impl CacheSet {
-    fn new(ways: usize, replacement: ReplacementPolicy) -> Self {
-        let replacement = match replacement {
-            ReplacementPolicy::Lru => ReplacementState::Lru,
-            ReplacementPolicy::TreePlru => ReplacementState::TreePlru {
-                bits: vec![false; ways - 1],
-            },
-        };
-
-        Self {
-            lines: vec![CacheLine::default(); ways],
-            replacement,
-        }
-    }
-
-    fn touch(&mut self, way: usize, timestamp: u64) {
-        self.lines[way].last_used = timestamp;
-
-        match &mut self.replacement {
-            ReplacementState::Lru => (),
-            ReplacementState::TreePlru { bits } => tree_plru_touch(bits, self.lines.len(), way),
-        }
-    }
-
-    fn victim(&self) -> usize {
-        if let Some(invalid) = self.lines.iter().position(|line| !line.valid) {
-            return invalid;
-        }
-
-        match &self.replacement {
-            ReplacementState::Lru => {
-                self.lines
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, line)| line.last_used)
-                    .unwrap()
-                    .0
-            }
-            ReplacementState::TreePlru { bits } => tree_plru_victim(bits, self.lines.len()),
-        }
-    }
-}
-
-struct CacheModel {
-    cfg: CacheConfig,
-    sets: Vec<CacheSet>,
-    stats: CacheStats,
-    timestamp: u64,
-}
-
-impl CacheModel {
-    fn new(
-        size: usize,
-        line_size: usize,
-        ways: usize,
-        replacement: ReplacementPolicy,
-    ) -> Result<Self, String> {
-        if size == 0 {
-            return Err("size must be non-zero".to_string());
-        }
-        if line_size == 0 {
-            return Err("line size must be non-zero".to_string());
-        }
-        if ways == 0 {
-            return Err("associativity must be non-zero".to_string());
-        }
-        if replacement == ReplacementPolicy::TreePlru && !ways.is_power_of_two() {
-            return Err("tree-plru associativity must be a power of two".to_string());
-        }
-        if size % line_size != 0 {
-            return Err("size must be a multiple of line size".to_string());
-        }
-
-        let lines = size / line_size;
-        if lines == 0 {
-            return Err("cache must contain at least one line".to_string());
-        }
-        if lines % ways != 0 {
-            return Err("number of lines must be a multiple of associativity".to_string());
-        }
-
-        let sets = lines / ways;
-        let cfg = CacheConfig {
-            size,
-            line_size,
-            ways,
-            sets,
-            replacement,
-        };
-
-        Ok(Self {
-            cfg,
-            sets: (0..sets)
-                .map(|_| CacheSet::new(ways, replacement))
-                .collect(),
-            stats: CacheStats::default(),
-            timestamp: 0,
-        })
-    }
-
-    fn from_spec(spec: &str, default_replacement: ReplacementPolicy) -> Result<Self, String> {
-        let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
-        if !(3..=4).contains(&parts.len()) {
-            return Err("expected SIZE,LINE_SIZE,WAYS[,POLICY]".to_string());
-        }
-
-        let size = parse_cache_usize(parts[0], "size")?;
-        let line_size = parse_cache_usize(parts[1], "line size")?;
-        let ways = parse_cache_usize(parts[2], "associativity")?;
-        let replacement = if parts.len() == 4 {
-            ReplacementPolicy::parse(parts[3])?
-        } else {
-            default_replacement
-        };
-
-        Self::new(size, line_size, ways, replacement)
-    }
-
-    fn reset_stats(&mut self) {
-        self.stats = CacheStats::default();
-    }
-
-    fn access(&mut self, addr: u64) -> bool {
-        self.stats.accesses += 1;
-        self.timestamp += 1;
-
-        let line_addr = addr / (self.cfg.line_size as u64);
-        let set_idx = (line_addr % (self.cfg.sets as u64)) as usize;
-        let tag = line_addr / (self.cfg.sets as u64);
-        let set = &mut self.sets[set_idx];
-
-        if let Some(hit_idx) = set
-            .lines
-            .iter()
-            .position(|line| line.valid && line.tag == tag)
-        {
-            self.stats.hits += 1;
-            set.touch(hit_idx, self.timestamp);
-            return true;
-        }
-
-        self.stats.misses += 1;
-        let replace_idx = set.victim();
-        set.lines[replace_idx] = CacheLine {
-            valid: true,
-            tag,
-            last_used: 0,
-        };
-        set.touch(replace_idx, self.timestamp);
-
-        false
-    }
-
-    fn print_stats(&self, name: &str) {
-        println!("--- {name} ---");
-        println!(
-            "Config: {} B, {} B lines, {}-way, {} sets, {} replacement",
-            self.cfg.size,
-            self.cfg.line_size,
-            self.cfg.ways,
-            self.cfg.sets,
-            self.cfg.replacement.name()
-        );
-        println!("Accesses: {}", self.stats.accesses);
-
-        let hit_rate = pct(self.stats.hits, self.stats.accesses);
-        let miss_rate = pct(self.stats.misses, self.stats.accesses);
-        println!("Hits: {} ({hit_rate:.2}%)", self.stats.hits);
-        println!("Misses: {} ({miss_rate:.2}%)", self.stats.misses);
-    }
-}
-
-fn tree_plru_touch(bits: &mut [bool], ways: usize, way: usize) {
-    let mut node = 0;
-    let mut base_way = 0;
-    let mut span = ways;
-
-    while node < bits.len() {
-        let half = span / 2;
-        let split = base_way + half;
-
-        if way < split {
-            // Bit values point toward the victim subtree. Touching the left
-            // subtree makes the right subtree the next PLRU candidate.
-            bits[node] = true;
-            node = 2 * node + 1;
-        } else {
-            // Touching the right subtree makes the left subtree the next PLRU
-            // candidate.
-            bits[node] = false;
-            node = 2 * node + 2;
-            base_way = split;
-        }
-
-        span = half;
-    }
-}
-
-fn tree_plru_victim(bits: &[bool], ways: usize) -> usize {
-    let mut node = 0;
-    let mut victim = 0;
-    let mut span = ways;
-
-    while node < bits.len() {
-        let half = span / 2;
-
-        if bits[node] {
-            victim += half;
-            node = 2 * node + 2;
-        } else {
-            node = 2 * node + 1;
-        }
-
-        span = half;
-    }
-
-    victim
-}
-
-fn parse_cache_usize(value: &str, name: &str) -> Result<usize, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{name} is empty"));
-    }
-
-    trimmed
-        .parse::<usize>()
-        .map_err(|_| format!("invalid {name}: `{trimmed}`"))
-}
-
-fn pct(part: u64, total: u64) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        100.0 * (part as f64) / (total as f64)
-    }
-}
-
-#[derive(Default)]
-struct TracerState {
-    // global
-    insts: u64,
-    compressed: u64,
-    vector: u64,
-
-    pc_annot: bool,
-    pc: u64,
-
-    // inst mix
-    meminsts: u64,
-    loadinsts: u64,
-    storeinsts: u64,
-    ctrlinsts: u64,
-    trapinsts: u64,
-    floatinsts: u64,
-    miscinsts: u64,
-    divinsts: u64,
-    fences: u64,
-
-    // asm dumper
-    asm_range: u64,
-
-    // fusionCheck
-    lastinst: Option<PitInst>,
-    fusions: u64,
-    logicfusion: u64,
-    adjloads: u64,
-    farloads: u64,
-    alubranch: u64,
-    alujalr: u64,
-    constbr: u64,
-    alubranch_dist: u64,
-    alubranch_dists: Vec<u64>,
-
-    // amo profiler
-    lrct: u64,
-    scct: u64,
-    amoct: u64,
-    aqct: u64,
-    rlct: u64,
-    aqrlct: u64,
-
-    // dfg/ilp analyzer
-    winsize: usize,
-    prunesize: usize,
-    verbose: bool,
-    dfg_window: VecDeque<PitInst>,
-
-    // cache models
-    dcache: Option<CacheModel>,
-}
-
-impl TracerState {
-    fn reset_for_measurement(&mut self, verbose: bool) {
-        let winsize = self.winsize;
-        let prunesize = self.prunesize;
-        let asm_range = self.asm_range;
-        let pc_annot = self.pc_annot;
-        let pc = self.pc;
-        let mut dcache = self.dcache.take();
-
-        if let Some(dcache) = dcache.as_mut() {
-            dcache.reset_stats();
-        }
-
-        *self = Self {
-            pc_annot,
-            pc,
-            winsize,
-            prunesize,
-            verbose,
-            asm_range,
-            dcache,
-            ..Default::default()
-        };
-    }
+    /// Dump branch trace to path path
+    #[arg(short = 'B', long)]
+    branch_trace: Option<String>,
 }
 
 fn inst_mix(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
@@ -876,12 +493,13 @@ fn asm_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
         }
 
         match pkt.unwrap().addr {
-            Some(x) =>
+            Some(x) => {
                 if pkt.unwrap().inst.mem() {
                     println!(" [0x{:08x}]", x)
                 } else {
                     println!(" [0x{:08x} -> 0x{:08x}]", state.pc, x)
-                },
+                }
+            }
             None => println!(""),
         };
     }
@@ -902,6 +520,63 @@ fn dcache_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
 
     if let (Some(dcache), Some(addr)) = (state.dcache.as_mut(), pkt.addr) {
         dcache.access(addr);
+    }
+}
+
+fn branch_trace_dump(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool) {
+    if finish {
+        println!("[inf] branch trace dumped");
+    } else {
+        // trace fmt: pc, jump addr, cond, indir, call, ret
+        let inst = pkt.unwrap().inst;
+        if !inst.branch() {
+            return;
+        };
+
+        let jmp_pc = pkt.unwrap().addr.unwrap();
+        let branch_trace_fp = state.branch_trace_fp.as_mut().unwrap();
+
+        match inst {
+            JALR { rd, rs1, .. } => {
+                writeln!(
+                    branch_trace_fp,
+                    "{:08x},{:08x},{},{},{},{}",
+                    state.pc,
+                    jmp_pc,
+                    0,
+                    1,
+                    (rd == 1 || rd == 5) as u8,
+                    ((rs1 == 1 || rs1 == 5) && rd != rs1) as u8
+                )
+                .expect("[err] failed to write to branch trace");
+            }
+
+            JAL { rd, .. } => {
+                writeln!(
+                    branch_trace_fp,
+                    "{:08x},{:08x},{},{},{},{}",
+                    state.pc,
+                    jmp_pc,
+                    0,
+                    0,
+                    (rd == 1 || rd == 5) as u8,
+                    0
+                )
+                .expect("[err] failed to write to branch trace");
+            }
+
+            // check for taken branches
+            _ if (state.pc + (if pkt.unwrap().compressed { 2 } else { 4 })) != jmp_pc => {
+                writeln!(
+                    branch_trace_fp,
+                    "{:08x},{:08x},{},{},{},{}",
+                    state.pc, jmp_pc, 1, 0, 0, 0
+                )
+                .expect("[err] failed to write to branch trace");
+            }
+
+            _ => (),
+        }
     }
 }
 
@@ -1364,6 +1039,25 @@ fn main() {
         },
     };
 
+    if args.branch_trace.is_some() && !args.pc_annot {
+        eprintln!("[err] cannot dump branch traces without a PC-annotated PIT dump");
+        return;
+    }
+
+    let branch_trace_fp = match args.branch_trace.as_deref() {
+        None => None,
+        Some(path) => match File::create(path) {
+            Ok(fp) => {
+                handlers.push(branch_trace_dump);
+                Some(fp)
+            }
+            Err(e) => {
+                eprintln!("[err] invalid branch trace path: {e}");
+                return;
+            }
+        },
+    };
+
     // read out the starting PC on annotated traces
     let start_pc = if args.pc_annot {
         let mut start_pcbuf = [0u8; 8];
@@ -1374,9 +1068,11 @@ fn main() {
                 return;
             }
 
-            Ok(_) => u64::from_le_bytes(start_pcbuf)
+            Ok(_) => u64::from_le_bytes(start_pcbuf),
         }
-    } else { 0u64 };
+    } else {
+        0u64
+    };
 
     let mut state = TracerState {
         pc_annot: args.pc_annot,
@@ -1387,6 +1083,7 @@ fn main() {
         verbose: args.verbose,
         asm_range: asm_range,
         dcache,
+        branch_trace_fp,
         ..Default::default()
     };
     let mut trace_insts = 0u64;
@@ -1432,9 +1129,7 @@ fn main() {
                 }
             }
 
-            _ if args.pc_annot &&
-                (inst.branch() ||
-                 inst.trap()) => {
+            _ if args.pc_annot && (inst.branch() || inst.trap()) => {
                 let mut npc = [0u8; 8];
 
                 match tracereader.read_exact(&mut npc) {
@@ -1455,7 +1150,24 @@ fn main() {
                 let opcode = u32::from_le_bytes(ibuf) & 0x7F;
                 if matches!(opcode, 0x7 | 0x27 | 0x57) {
                     state.vector += 1;
-                } else {
+                } else if opcode == 0xb {
+                    let mut npcbuf = [0u8; 8];
+
+                    tracereader.read_exact(&mut npcbuf)
+                        .expect("[err] faulted while parsing a trap pc");
+
+                    let npc = u64::from_le_bytes(npcbuf);
+
+                    if state.insts < state.asm_range {
+                        println!(
+                            "redirect: 0x{:08x} -> 0x{:08x}",
+                            state.pc, npc
+                        );
+                    }
+
+                    state.pc = npc;
+                    continue;
+                } {
                     println!(
                         "[inf] unsupported instr: 0x{:08x} @ order {}",
                         u32::from_le_bytes(ibuf),
