@@ -5,6 +5,7 @@
 
 #define PITBUFSZ 512
 FILE *pit_fp = NULL;
+static bool pit_pc_annot = false;
 
 pitPacket pitbuf[PITBUFSZ];
 bool pitbuf_hasaddr[PITBUFSZ];
@@ -14,7 +15,8 @@ int pitcount = 0;
 int pitmemcount = 0;
 int pitctrlcount = 0;
 
-void init_pit(const char *file) {
+void init_pit(const char *file, bool pc_annot) {
+  pit_pc_annot = pc_annot;
   if (file == NULL) return;
   pit_fp = fopen(file, "w");
   Assert(pit_fp, "Can not open '%s'", file);
@@ -30,7 +32,7 @@ void drain_pit() {
 }
 
 void redirect_pit(uint64_t redir_pc) {
-  if (pit_fp) {
+  if (pit_fp && pit_pc_annot) {
     if (pitcount <= warmup_interval) return;
 
     drain_pit();
@@ -43,18 +45,19 @@ void redirect_pit(uint64_t redir_pc) {
 void pit(Decode *pkt, uint64_t next_pc, bool is_ctrl) {
   if (pit_fp) {
     if (pitcount++ < warmup_interval) return;
-    if (pitcount == warmup_interval + 1)
+    if (pit_pc_annot && pitcount == warmup_interval + 1)
       fwrite(&(pkt->pc), sizeof(uint64_t), 1, pit_fp);
 
-    pitbuf_hasaddr[pitptr] = pkt->is_mem | is_ctrl;
+    bool has_pc_annot = pit_pc_annot && is_ctrl;
+    pitbuf_hasaddr[pitptr] = pkt->is_mem || has_pc_annot;
     pitbuf[pitptr] = (pitPacket) {
       .instr = pkt->isa.instr.val,
-      .memaddr = is_ctrl ? next_pc : pkt->maddr
+      .memaddr = has_pc_annot ? next_pc : pkt->maddr
     };
 
     pitptr++;
     pitmemcount += (int)pkt->is_mem;
-    pitctrlcount += (int)is_ctrl;
+    pitctrlcount += (int)has_pc_annot;
 
     if (pitptr == PITBUFSZ) {
       drain_pit();

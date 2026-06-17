@@ -1167,7 +1167,7 @@ fn main() {
 
                     state.pc = npc;
                     continue;
-                } {
+                } else {
                     println!(
                         "[inf] unsupported instr: 0x{:08x} @ order {}",
                         u32::from_le_bytes(ibuf),

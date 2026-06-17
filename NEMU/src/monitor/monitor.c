@@ -36,10 +36,11 @@ void init_wp_pool();
 void init_difftest(char *ref_so_file, long img_size, long flash_size, int port);
 void init_device();
 
-void init_pit(const char *file);
+void init_pit(const char *file, bool pc_annot);
 
 static char *log_file = NULL;
 static char *pit_file = NULL;
+static bool pit_pc_annot = false;
 bool small_log = false;
 bool fast_log = false;
 static char *diff_so_file = NULL;
@@ -140,6 +141,7 @@ static inline int parse_args(int argc, char *argv[]) {
 
     // PIT (Profiling Instruction Trace)
     {"dump-pit", required_argument, NULL, 'P'},
+    {"pit-pc-annot", no_argument, NULL, 21},
 
     {0          , 0                , NULL,  0 },
   };
@@ -152,6 +154,7 @@ static inline int parse_args(int argc, char *argv[]) {
     case 'l': log_file = optarg; break;
     case 'd': diff_so_file = optarg; break;
     case 'P': pit_file = optarg; break;
+    case 21: pit_pc_annot = true; break;
     case 1: {
       img_file = optarg;
       if (ISDEF(CONFIG_MODE_USER)) {
@@ -323,6 +326,8 @@ static inline int parse_args(int argc, char *argv[]) {
       //        printf("\t--cpt-id                checkpoint id\n");
       printf("\t-M,--dump-mem=DUMP_FILE dump memory into FILE\n");
       printf("\t-R,--dump-reg=DUMP_FILE dump register value into FILE\n");
+      printf("\t-P,--dump-pit=PIT_FILE  dump PIT trace into FILE\n");
+      printf("\t--pit-pc-annot          include PC/control/redirect annotations in PIT\n");
       printf("\n");
       exit(0);
     }
@@ -342,7 +347,7 @@ void init_monitor(int argc, char *argv[]) {
 
   /* Open the log file. */
   init_log(log_file, fast_log, small_log);
-  init_pit(pit_file);
+  init_pit(pit_file, pit_pc_annot);
 
   if (warmup_interval == 0) {
     warmup_interval = checkpoint_interval;
